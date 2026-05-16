@@ -1,0 +1,38 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+
+# Go workspace files
+go.work
+go.work.sum
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Local env
+.env
+.env.*
+*.local
+
+# Internal-tooling artifacts (must not appear in public history)
+.agentrc/
+.claude/
+agentrc.yaml
+agentrc.yml
+CLAUDE.md
+AGENTS.md
+AUDIT_RESULTS.md
+.lefthook.yml
+lefthook.yml
