@@ -1,17 +1,20 @@
 # go-scheduler
 
-A small cron-driven schedule engine for Go. `go-scheduler` defines an `Engine`
-that polls a `Store` on a fixed tick, claims due schedules atomically, and
-dispatches them to a `Runner`. It is decoupled from any application's
-persistence layer and job types through two neutral descriptors — `Schedule`
-and `Job` — so the same engine can drive scheduled work in any service.
+`go-scheduler` is an application-neutral timed activation engine for Go. It
+materializes due schedules into durable fires, claims each fire attempt with
+compare-and-swap semantics, and dispatches opaque jobs to a `Runner`.
+
+The library owns time, fire identity, generic retry state, and lifecycle
+observation. Applications continue to own job types, workflow or loop/reflex
+semantics, event names, activation policy, persistence schemas, and execution.
 
 ## Status
 
-Pre-1.0 (`v0.1.x`). The public API is stable in shape — `Engine`, `Schedule`,
-`Job`, the `Store` and `Runner` interfaces — but minor breaks may still happen
-between `v0.x` releases. See [`CHANGELOG.md`](CHANGELOG.md) for per-release
-detail and pin a version in your `go.mod`.
+Pre-1.0. The current branch introduces a breaking `Store` migration from the
+schedule-row-only v0.1 contract to durable schedule plus fire contracts. The
+common constructor remains source-compatible as `New(store, runner)` and keeps
+the v0.1 defaults. See [CHANGELOG.md](CHANGELOG.md) for the migration checklist
+and pin a version in `go.mod`.
 
 Documentation: [pkg.go.dev/github.com/hollis-labs/go-scheduler](https://pkg.go.dev/github.com/hollis-labs/go-scheduler).
 
@@ -23,112 +26,169 @@ go get github.com/hollis-labs/go-scheduler
 
 ## Usage
 
-You provide two things: a `Store` over your schedule records and a `Runner`
-that dispatches a fired schedule's job. The engine owns the tick loop, the
-atomic claim, and one-time-schedule disabling.
+Implement `Store` over durable schedule and fire records, and implement
+`Runner` over your queue or executor:
 
 ```go
-package main
+engine := scheduler.New(store, runner)
+engine.Start()
+defer engine.Stop()
+```
 
-import (
-    "context"
-    "time"
+The call above uses the backward-compatible one-second cadence, due-batch
+limit of 100, system clock, and no observer. Optional configuration is additive:
 
-    scheduler "github.com/hollis-labs/go-scheduler"
+```go
+engine := scheduler.New(
+    store,
+    runner,
+    scheduler.WithClock(clock),
+    scheduler.WithTickCadence(250*time.Millisecond),
+    scheduler.WithDueBatchLimit(50),
+    scheduler.WithObserver(observer),
 )
-
-func main() {
-    eng := scheduler.New(myStore, myRunner)
-    eng.Start()
-    defer eng.Stop()
-
-    select {} // run until shutdown
-}
 ```
 
-Implement the two seams over your own types, converting to and from the
-neutral `Schedule` and `Job` at the boundary:
+`TickNow(ctx)` runs one deterministic tick using the configured clock. A custom
+clock implements `Now` and `NewTicker`; this makes both synchronous and
+background-loop tests independent of wall time.
+
+## Stable Fire Identity
+
+A schedule occurrence is identified by:
 
 ```go
-type store struct{ db *sql.DB }
-
-func (s store) ListDueSchedules(ctx context.Context, now time.Time, limit int) ([]scheduler.Schedule, error) {
-    // load your own records, then map each into scheduler.Schedule —
-    // packing app-specific fields into JobType + Payload.
-}
-
-// ClaimAndUpdateScheduleRun, SetScheduleNextRun, DisableSchedule ...
-
-type runner struct{ exec *Executor }
-
-func (r runner) Enqueue(ctx context.Context, job scheduler.Job) error {
-    // decode job.Payload, hand off to your executor; if the job is already
-    // enqueued, return an error wrapping scheduler.ErrDuplicateJob.
-}
+fireID := scheduler.DeriveFireID(scheduleID, scheduledAt)
 ```
 
-The cron helpers are usable on their own — for validating user input before
-a schedule is stored:
+The derivation uses only the schedule ID and the scheduled fire time normalized
+to UTC. Observed tick time and attempt number do not participate. Consequently:
+
+- the same occurrence keeps one `Fire.ID` across ticks, processes, and retries;
+- `Fire.ScheduledAt` records when the occurrence was due;
+- `Fire.FiredAt` records when the current attempt was observed; and
+- `Fire.Attempt` is one-based after a successful claim.
+
+`Job.FireID` is the canonical dispatch identity. `Job.RunID` is deprecated but
+is still populated as the exact same value for v0.1 consumers; it is not a
+second identity. `Job.ScheduledAt`, `Job.FiredAt`, and `Job.Attempt` preserve the
+same distinctions at the runner seam.
+
+## Durable Store Contract
+
+`Store` is intentionally record-shape-neutral. Its operations define required
+atomic behavior without prescribing tables or fields:
+
+- `ListDueSchedules` returns enabled schedules due for materialization.
+- `CreateFire` atomically verifies the observed schedule `NextRun`, creates the
+  derived fire if its ID has never existed, and advances the schedule. A
+  terminal fire must never be recreated.
+- `ListDueFires` returns persisted `pending` or `retrying` fires whose next
+  attempt time is due.
+- `ClaimFire` atomically compares status and attempt, increments the attempt,
+  records observed `FiredAt`, and changes the status to `claimed`.
+- `TransitionFire` atomically compares the claimed status and attempt before
+  recording `retrying`, `succeeded`, `skipped`, or `exhausted`.
+- `DisableSchedule` disables a one-time schedule after its durable fire is
+  materialized. The fire remains dispatchable.
+
+Both materialization uniqueness and per-attempt claims are compare-and-swap
+boundaries. Two engines may list the same due records, but only one can create a
+given fire and only one can dispatch a given attempt.
+
+## Retry And Exhaustion
+
+Retry behavior is persisted with each `Fire`:
 
 ```go
-if err := scheduler.ValidateCron(expr); err != nil { /* reject */ }
-next, _ := scheduler.NextRun(expr, time.Now())
+retry := scheduler.RetryPolicy{
+    MaxAttempts: 4, // includes the initial attempt
+    Backoff: scheduler.BackoffPolicy{
+        Strategy:     scheduler.BackoffExponential,
+        InitialDelay: time.Second,
+        MaxDelay:     30 * time.Second,
+    },
+}
 ```
+
+Supported backoff strategies are `none`, `constant`, `linear`, and
+`exponential`. `MaxAttempts == 0` is unbounded, preserving the v0.1 retry
+default; configure a positive value when exhaustion is required. Once a fire is
+`exhausted`, it is terminal and its stable ID prevents a later tick from
+materializing the same occurrence again.
+
+A normal enqueue error produces either `retrying` or `exhausted` according to
+the persisted policy. A runner that recognizes an already-dispatched
+`Job.FireID` returns an error wrapping `ErrDuplicateJob`; the engine records
+that fire as terminal `skipped` without counting a worker error.
+
+## Observation
+
+An optional `Observer` receives application-neutral events for:
+
+- `claim`
+- `fire`
+- `retry`
+- `skip`
+- `success`
+- `exhaustion`
+- `disable`
+- `engine_error`
+
+`ObserverEvent` supplies the current fire plus generic time, reason, operation,
+retry time, and error context where relevant. It does not define application
+event names or a persistence schema. Observer callbacks run synchronously, but
+returned errors and panics are isolated: they increment
+`Status.ObserverErrors` and do not alter claims, transitions, or dispatch
+outcomes.
 
 ## API Overview
 
-Package `github.com/hollis-labs/go-scheduler`:
+- `Engine` / `New(store, runner, ...Option)` — materializes and dispatches due
+  fires. `Start` and `Stop` are idempotent; `TickNow` runs synchronously.
+- `Schedule` — neutral cron/one-time descriptor with opaque job payload and
+  `RetryPolicy`.
+- `Fire` / `FireStatus` — durable identity, attempt, timing, retry, and terminal
+  status contract.
+- `FireCreation`, `FireClaim`, `FireTransition` — store CAS request contracts.
+- `Job` / `Runner` — opaque dispatch seam.
+- `Observer`, `ObserverFunc`, `ObserverEvent` — neutral lifecycle hooks.
+- `Clock`, `Ticker`, and engine options — deterministic time and polling.
+- `Status` — dispatch, retry, skip, exhaustion, worker-error, and observer-error
+  counters.
+- `ValidateCron`, `NextRun`, and `DeriveFireID` — standalone helpers.
 
-- `Engine` / `New(store, runner)` — polls the `Store` every second and
-  dispatches due schedules. `Start` / `Stop` are idempotent; `Stop` blocks
-  until the loop exits. `TickNow` runs a single tick synchronously.
-- `Schedule` — neutral schedule descriptor: `ID`, `CronExpr`, `LastRun`,
-  `NextRun`, `Enabled`, and an opaque job descriptor (`JobType` + `Payload`).
-  An empty `CronExpr` marks a one-time schedule.
-- `Job` — neutral dispatch descriptor handed to a `Runner`: `ScheduleID`,
-  engine-generated `RunID`, `JobType`, `Payload`, `FiredAt`.
-- `Store` — persistence seam: `ListDueSchedules`, `ClaimAndUpdateScheduleRun`,
-  `SetScheduleNextRun`, `DisableSchedule`.
-- `Runner` — dispatch seam: `Enqueue(ctx, Job)`.
-- `Status` — engine snapshot: `Running`, `LastTickAt`, `Dispatches`,
-  `WorkerErrors`.
-- `ValidateCron(expr)` / `NextRun(expr, from)` — standard-cron helpers.
-- Sentinel: `ErrDuplicateJob`.
+## v0.1 Store Migration
 
-## Architecture Notes
+`New(store, runner)` still compiles after the store implements the new
+interface. Existing v0.1 stores must replace:
 
-The engine never sees an application's own types. `Store` returns neutral
-`Schedule` values and `Runner` consumes neutral `Job` values; an application
-maps its records and job payloads at the interface boundary. This is the same
-split `go-queue` makes between its `Queue` driver contract and its `Worker`.
+- `ClaimAndUpdateScheduleRun`
+- `SetScheduleNextRun`
 
-Double-dispatch is prevented by `Store.ClaimAndUpdateScheduleRun`: it advances
-a schedule's run state only if the stored next-run still matches the value the
-tick observed. Two concurrent ticks (or processes) race on that compare-and-set
-and only one wins the claim. A failed dispatch rolls the schedule's next-run
-back so the following tick retries it; if the failure wraps `ErrDuplicateJob`
-the retry is silent, otherwise it is counted in `Status.WorkerErrors`.
+with durable `CreateFire`, `ListDueFires`, `ClaimFire`, and `TransitionFire`
+operations. `ListDueSchedules` and `DisableSchedule` remain. Applications must
+persist fires so retries and exhaustion survive ticks and process restarts.
 
-A one-time schedule is a `Schedule` with an empty `CronExpr`. It fires once
-and the engine calls `Store.DisableSchedule` after a successful dispatch.
+Existing runners may continue reading `Job.RunID` during migration, but should
+switch deduplication to `Job.FireID`. Unlike v0.1, `ErrDuplicateJob` terminates
+the fire as `skipped` instead of requeuing it indefinitely.
 
 ## Dependencies
 
-Direct:
-
-- [`github.com/robfig/cron/v3`](https://pkg.go.dev/github.com/robfig/cron/v3) —
-  standard-cron parsing for `ValidateCron` and `NextRun`. Pinned in `go.mod`.
-
-The package has no other external dependencies.
+The only direct external dependency is
+[`github.com/robfig/cron/v3`](https://pkg.go.dev/github.com/robfig/cron/v3) for
+standard cron parsing. The module imports no application packages.
 
 ## Testing
 
 ```bash
 go test ./...
+go test -race ./...
 ```
 
-The tests use in-memory fake `Store` and `Runner` implementations — no
-environment variables, fixtures, or external services are needed.
+The test suite uses in-memory contract fakes and includes a concurrent
+two-engine CAS test proving that one fire attempt cannot dispatch twice.
 
 ## License
 
