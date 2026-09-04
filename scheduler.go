@@ -152,21 +152,24 @@ const (
 )
 
 // Fire is a durable scheduled-fire record. ID and ScheduledAt never change
-// across attempts. FiredAt is when the current/most recent attempt was
-// observed by an engine, and Attempt is one-based after a successful claim.
-// Pending fires therefore begin at attempt zero.
+// across attempts. FiredAt identifies the current/most recent claim epoch and
+// ClaimExpiresAt bounds that claim's lease. Attempt is one-based after a
+// successful pending/retrying claim. Recovering an expired claim keeps the
+// same Attempt but replaces FiredAt, fencing the stale owner. Pending fires
+// therefore begin at attempt zero.
 type Fire struct {
-	ID            string      `json:"id"`
-	ScheduleID    string      `json:"schedule_id"`
-	ScheduledAt   time.Time   `json:"scheduled_at"`
-	FiredAt       time.Time   `json:"fired_at"`
-	Attempt       int         `json:"attempt"`
-	Status        FireStatus  `json:"status"`
-	NextAttemptAt time.Time   `json:"next_attempt_at"`
-	LastError     string      `json:"last_error,omitempty"`
-	Retry         RetryPolicy `json:"retry"`
-	JobType       string      `json:"job_type"`
-	Payload       []byte      `json:"payload"`
+	ID             string      `json:"id"`
+	ScheduleID     string      `json:"schedule_id"`
+	ScheduledAt    time.Time   `json:"scheduled_at"`
+	FiredAt        time.Time   `json:"fired_at"`
+	ClaimExpiresAt time.Time   `json:"claim_expires_at"`
+	Attempt        int         `json:"attempt"`
+	Status         FireStatus  `json:"status"`
+	NextAttemptAt  time.Time   `json:"next_attempt_at"`
+	LastError      string      `json:"last_error,omitempty"`
+	Retry          RetryPolicy `json:"retry"`
+	JobType        string      `json:"job_type"`
+	Payload        []byte      `json:"payload"`
 }
 
 // DeriveFireID returns the stable identity for a schedule occurrence. Only
@@ -191,23 +194,30 @@ type FireCreation struct {
 }
 
 // FireClaim asks a Store to atomically claim exactly one attempt. On success,
-// ClaimFire increments Attempt, sets Status to FireClaimed, records ClaimedAt
-// as FiredAt, and returns that updated Fire. ExpectedStatus and ExpectedAttempt
-// are the compare-and-swap preconditions.
+// ClaimFire sets Status to FireClaimed, records ClaimedAt as FiredAt, records
+// ClaimExpiresAt, and returns that updated Fire. It increments Attempt when
+// ExpectedStatus is pending or retrying and preserves Attempt when recovering
+// an expired claimed fire. ExpectedStatus, ExpectedAttempt, and
+// ExpectedFiredAt are the compare-and-swap preconditions. A Store must reject
+// recovery when the stored ClaimExpiresAt is after ClaimedAt.
 type FireClaim struct {
 	FireID          string
 	ExpectedStatus  FireStatus
 	ExpectedAttempt int
+	ExpectedFiredAt time.Time
 	ClaimedAt       time.Time
+	ClaimExpiresAt  time.Time
 }
 
 // FireTransition is a compare-and-swap lifecycle update after an attempt.
-// Attempt and From must still match the stored fire. Retry transitions set
-// NextAttemptAt; terminal transitions leave it zero.
+// Attempt, From, and ClaimedAt must still match the stored fire. Retry
+// transitions set NextAttemptAt; terminal transitions leave it zero. Every
+// successful transition clears ClaimExpiresAt in the stored fire.
 type FireTransition struct {
 	FireID        string
 	Attempt       int
 	From          FireStatus
+	ClaimedAt     time.Time
 	To            FireStatus
 	At            time.Time
 	NextAttemptAt time.Time
@@ -228,15 +238,23 @@ type Store interface {
 	CreateFire(ctx context.Context, creation FireCreation) (bool, error)
 
 	// ListDueFires returns up to limit pending or retrying fires whose
-	// NextAttemptAt is at or before now. Terminal and claimed fires are not due.
+	// NextAttemptAt is at or before now, plus claimed fires whose claim lease
+	// has expired. Terminal fires and unexpired claims are not due.
 	ListDueFires(ctx context.Context, now time.Time, limit int) ([]Fire, error)
 
-	// ClaimFire performs the per-fire, per-attempt compare-and-swap described
-	// by FireClaim.
+	// ClaimFire performs the compare-and-swap described by FireClaim. For a
+	// pending or retrying fire it increments Attempt. For an expired claimed
+	// fire it keeps the same Attempt and replaces FiredAt and ClaimExpiresAt;
+	// this redelivers the ambiguous attempt after a process crash without
+	// consuming another application-level retry. It must also verify that the
+	// stored lease is expired at claim. ExpectedFiredAt prevents a stale owner
+	// from winning after the lease has been replaced.
 	ClaimFire(ctx context.Context, claim FireClaim) (Fire, bool, error)
 
-	// TransitionFire atomically applies an attempt result if Attempt and From
-	// still match. It returns false on a lost compare-and-swap race.
+	// TransitionFire atomically applies an attempt result if Attempt, From, and
+	// ClaimedAt still match. Including the claim timestamp fences a stale owner
+	// after an expired claim has been recovered. It returns false on a lost
+	// compare-and-swap race.
 	TransitionFire(ctx context.Context, transition FireTransition) (bool, error)
 
 	// DisableSchedule marks a schedule disabled. The engine calls it after it

@@ -4,7 +4,7 @@
 //
 // The engine is decoupled from application persistence, policy, and job types
 // through neutral Schedule, Fire, Job, Store, Runner, and Observer contracts.
-// Store implementations provide atomic fire materialization, attempt claims,
-// and result transitions over their own schemas. The engine itself depends
-// only on this package and github.com/robfig/cron/v3.
+// Store implementations provide atomic fire materialization, leased attempt
+// claims, restart recovery, and result transitions over their own schemas. The
+// engine itself depends only on this package and github.com/robfig/cron/v3.
 package scheduler

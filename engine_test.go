@@ -16,20 +16,21 @@ type fakeStore struct {
 	schedules map[string]Schedule
 	fires     map[string]Fire
 
-	createCount     int
-	claimCount      int
-	transitions     []FireTransition
-	disabled        map[string]bool
-	scheduleLimit   int
-	fireLimit       int
-	listErr         error
-	listCalled      chan struct{}
-	fireListBarrier chan struct{}
-	fireListCalls   int
-	claimResult     func(Fire) Fire
-	transitionErr   error
-	transitionLost  bool
-	disableErr      error
+	createCount              int
+	claimCount               int
+	transitions              []FireTransition
+	disabled                 map[string]bool
+	scheduleLimit            int
+	fireLimit                int
+	listErr                  error
+	listCalled               chan struct{}
+	fireListBarrier          chan struct{}
+	fireListCalls            int
+	claimResult              func(Fire) Fire
+	transitionErr            error
+	transitionLost           bool
+	rejectCanceledTransition bool
+	disableErr               error
 }
 
 func newFakeStore(schedules ...Schedule) *fakeStore {
@@ -101,7 +102,9 @@ func (f *fakeStore) ListDueFires(_ context.Context, now time.Time, limit int) ([
 	f.fireLimit = limit
 	due := make([]Fire, 0)
 	for _, fire := range f.fires {
-		if (fire.Status == FirePending || fire.Status == FireRetrying) && !fire.NextAttemptAt.After(now) {
+		attemptDue := (fire.Status == FirePending || fire.Status == FireRetrying) && !fire.NextAttemptAt.After(now)
+		claimExpired := fire.Status == FireClaimed && !fire.ClaimExpiresAt.After(now)
+		if attemptDue || claimExpired {
 			fire.Payload = append([]byte(nil), fire.Payload...)
 			due = append(due, fire)
 		}
@@ -130,12 +133,20 @@ func (f *fakeStore) ClaimFire(_ context.Context, claim FireClaim) (Fire, bool, e
 	defer f.mu.Unlock()
 
 	fire, ok := f.fires[claim.FireID]
-	if !ok || fire.Status != claim.ExpectedStatus || fire.Attempt != claim.ExpectedAttempt {
+	if !ok || fire.Status != claim.ExpectedStatus || fire.Attempt != claim.ExpectedAttempt ||
+		!fire.FiredAt.Equal(claim.ExpectedFiredAt) {
+		return Fire{}, false, nil
+	}
+	recovering := fire.Status == FireClaimed
+	if recovering && fire.ClaimExpiresAt.After(claim.ClaimedAt) {
 		return Fire{}, false, nil
 	}
 	fire.Status = FireClaimed
-	fire.Attempt++
+	if !recovering {
+		fire.Attempt++
+	}
 	fire.FiredAt = claim.ClaimedAt
+	fire.ClaimExpiresAt = claim.ClaimExpiresAt
 	fire.NextAttemptAt = time.Time{}
 	f.fires[fire.ID] = fire
 	f.claimCount++
@@ -145,9 +156,12 @@ func (f *fakeStore) ClaimFire(_ context.Context, claim FireClaim) (Fire, bool, e
 	return fire, true, nil
 }
 
-func (f *fakeStore) TransitionFire(_ context.Context, transition FireTransition) (bool, error) {
+func (f *fakeStore) TransitionFire(ctx context.Context, transition FireTransition) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.rejectCanceledTransition && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
 	if f.transitionErr != nil {
 		return false, f.transitionErr
 	}
@@ -156,10 +170,12 @@ func (f *fakeStore) TransitionFire(_ context.Context, transition FireTransition)
 	}
 
 	fire, ok := f.fires[transition.FireID]
-	if !ok || fire.Status != transition.From || fire.Attempt != transition.Attempt {
+	if !ok || fire.Status != transition.From || fire.Attempt != transition.Attempt ||
+		!fire.FiredAt.Equal(transition.ClaimedAt) {
 		return false, nil
 	}
 	fire.Status = transition.To
+	fire.ClaimExpiresAt = time.Time{}
 	fire.NextAttemptAt = transition.NextAttemptAt
 	fire.LastError = transition.Error
 	f.fires[fire.ID] = fire
@@ -203,6 +219,12 @@ type fakeRunner struct {
 	mu        sync.Mutex
 	jobs      []Job
 	responses []error
+}
+
+type runnerFunc func(context.Context, Job) error
+
+func (f runnerFunc) Enqueue(ctx context.Context, job Job) error {
+	return f(ctx, job)
 }
 
 func (f *fakeRunner) Enqueue(_ context.Context, job Job) error {
@@ -597,6 +619,182 @@ func TestRetryPreservesFireIdentityAndScheduledTime(t *testing.T) {
 	}
 }
 
+func TestRestartRecoversExpiredClaimWithoutConsumingRetry(t *testing.T) {
+	scheduledAt := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	claimedAt := scheduledAt.Add(time.Minute)
+	lease := 5 * time.Minute
+	clock := newFakeClock(claimedAt.Add(lease))
+	store := newFakeStore()
+	fire := Fire{
+		ID:             DeriveFireID("schedule-restart", scheduledAt),
+		ScheduleID:     "schedule-restart",
+		ScheduledAt:    scheduledAt,
+		FiredAt:        claimedAt,
+		ClaimExpiresAt: claimedAt.Add(lease),
+		Attempt:        1,
+		Status:         FireClaimed,
+		Retry:          RetryPolicy{MaxAttempts: 1},
+		JobType:        "opaque-kind",
+		Payload:        []byte(`{"restart":true}`),
+	}
+	store.fires[fire.ID] = fire
+	runner := &fakeRunner{}
+	observer := &recordingObserver{}
+	restarted := New(store, runner, WithClock(clock), WithClaimLease(lease), WithObserver(observer))
+
+	if err := restarted.TickNow(context.Background()); err != nil {
+		t.Fatalf("restart tick failed: %v", err)
+	}
+
+	jobs := runner.snapshot()
+	if len(jobs) != 1 {
+		t.Fatalf("restarted engine dispatched %d jobs, want 1", len(jobs))
+	}
+	if jobs[0].FireID != fire.ID || jobs[0].Attempt != 1 {
+		t.Fatalf("recovery changed fire identity or consumed a retry: %+v", jobs[0])
+	}
+	recovered := store.fire(fire.ID)
+	if recovered.Status != FireSucceeded || recovered.Attempt != 1 || !recovered.ClaimExpiresAt.IsZero() {
+		t.Fatalf("recovered fire = %+v", recovered)
+	}
+	events := observer.snapshot()
+	if len(events) < 1 || events[0].Kind != ObserverClaim || events[0].Reason != "expired_claim_recovery" {
+		t.Fatalf("recovery claim event = %+v", events)
+	}
+}
+
+func TestRestartDoesNotRecoverUnexpiredClaim(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	store := newFakeStore()
+	fire := Fire{
+		ID:             DeriveFireID("schedule-live-owner", now),
+		ScheduleID:     "schedule-live-owner",
+		ScheduledAt:    now,
+		FiredAt:        now,
+		ClaimExpiresAt: now.Add(time.Minute),
+		Attempt:        1,
+		Status:         FireClaimed,
+	}
+	store.fires[fire.ID] = fire
+	runner := &fakeRunner{}
+	restarted := New(store, runner, WithClock(newFakeClock(now)))
+
+	if err := restarted.TickNow(context.Background()); err != nil {
+		t.Fatalf("restart tick failed: %v", err)
+	}
+	if jobs := runner.snapshot(); len(jobs) != 0 {
+		t.Fatalf("unexpired claim was redelivered: %+v", jobs)
+	}
+}
+
+func TestRecoveredClaimFencesStaleOwnerTransition(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	oldClaimedAt := now.Add(-time.Minute)
+	store := newFakeStore()
+	fire := Fire{
+		ID:             DeriveFireID("schedule-fence", now.Add(-time.Hour)),
+		ScheduleID:     "schedule-fence",
+		ScheduledAt:    now.Add(-time.Hour),
+		FiredAt:        oldClaimedAt,
+		ClaimExpiresAt: now,
+		Attempt:        2,
+		Status:         FireClaimed,
+	}
+	store.fires[fire.ID] = fire
+
+	recovered, won, err := store.ClaimFire(context.Background(), FireClaim{
+		FireID:          fire.ID,
+		ExpectedStatus:  FireClaimed,
+		ExpectedAttempt: 2,
+		ExpectedFiredAt: oldClaimedAt,
+		ClaimedAt:       now,
+		ClaimExpiresAt:  now.Add(time.Minute),
+	})
+	if err != nil || !won {
+		t.Fatalf("recover claim: won=%t err=%v", won, err)
+	}
+	if recovered.Attempt != 2 || !recovered.FiredAt.Equal(now) {
+		t.Fatalf("recovered claim = %+v", recovered)
+	}
+
+	transitioned, err := store.TransitionFire(context.Background(), FireTransition{
+		FireID:    fire.ID,
+		Attempt:   2,
+		From:      FireClaimed,
+		ClaimedAt: oldClaimedAt,
+		To:        FireSucceeded,
+		At:        now,
+	})
+	if err != nil {
+		t.Fatalf("stale transition: %v", err)
+	}
+	if transitioned {
+		t.Fatal("stale owner transitioned a recovered claim")
+	}
+}
+
+func TestCrashAfterDispatchRecoversAsDuplicateSkip(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	lease := time.Minute
+	clock := newFakeClock(now)
+	store := newFakeStore(Schedule{ID: "crash-after-dispatch", NextRun: now, Enabled: true})
+	store.transitionErr = errors.New("process lost persistence")
+	runner := &fakeRunner{responses: []error{nil, fmt.Errorf("queue: %w", ErrDuplicateJob)}}
+	first := New(store, runner, WithClock(clock), WithClaimLease(lease))
+
+	if err := first.TickNow(context.Background()); err != nil {
+		t.Fatalf("first tick failed: %v", err)
+	}
+	fireID := DeriveFireID("crash-after-dispatch", now)
+	stranded := store.fire(fireID)
+	if stranded.Status != FireClaimed || stranded.Attempt != 1 {
+		t.Fatalf("fire was not left ambiguously claimed: %+v", stranded)
+	}
+
+	store.transitionErr = nil
+	clock.set(now.Add(lease - time.Nanosecond))
+	restarted := New(store, runner, WithClock(clock), WithClaimLease(lease))
+	if err := restarted.TickNow(context.Background()); err != nil {
+		t.Fatalf("early restart tick failed: %v", err)
+	}
+	if got := len(runner.snapshot()); got != 1 {
+		t.Fatalf("unexpired restart produced %d dispatches, want 1", got)
+	}
+
+	clock.set(now.Add(lease))
+	if err := restarted.TickNow(context.Background()); err != nil {
+		t.Fatalf("lease-expiry tick failed: %v", err)
+	}
+	if got := len(runner.snapshot()); got != 2 {
+		t.Fatalf("expired restart produced %d dispatches, want 2", got)
+	}
+	recovered := store.fire(fireID)
+	if recovered.Status != FireSkipped || recovered.Attempt != 1 {
+		t.Fatalf("duplicate recovery fire = %+v", recovered)
+	}
+}
+
+func TestOutcomeTransitionSurvivesCallerCancellation(t *testing.T) {
+	now := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
+	clock := newFakeClock(now)
+	store := newFakeStore(Schedule{ID: "cancelled", NextRun: now, Enabled: true})
+	store.rejectCanceledTransition = true
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := runnerFunc(func(context.Context, Job) error {
+		cancel()
+		return nil
+	})
+	engine := New(store, runner, WithClock(clock))
+
+	if err := engine.TickNow(ctx); err != nil {
+		t.Fatalf("tick failed: %v", err)
+	}
+	fire := store.fire(DeriveFireID("cancelled", now))
+	if fire.Status != FireSucceeded {
+		t.Fatalf("cancelled caller prevented outcome persistence: %+v", fire)
+	}
+}
+
 func TestExhaustedFireCannotResetOnLaterTick(t *testing.T) {
 	scheduledAt := time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC)
 	clock := newFakeClock(scheduledAt)
@@ -868,8 +1066,9 @@ func TestInjectedClockCadenceAndDefaults(t *testing.T) {
 	}
 
 	defaultEngine := New(newFakeStore(), &fakeRunner{})
-	if defaultEngine.tickCadence != DefaultTickCadence || defaultEngine.dueBatchLimit != DefaultDueBatchLimit {
-		t.Fatalf("defaults = %s/%d", defaultEngine.tickCadence, defaultEngine.dueBatchLimit)
+	if defaultEngine.tickCadence != DefaultTickCadence || defaultEngine.dueBatchLimit != DefaultDueBatchLimit ||
+		defaultEngine.claimLease != DefaultClaimLease {
+		t.Fatalf("defaults = %s/%d/%s", defaultEngine.tickCadence, defaultEngine.dueBatchLimit, defaultEngine.claimLease)
 	}
 }
 
@@ -907,13 +1106,13 @@ func TestRetryAndExhaustionObserverHooks(t *testing.T) {
 	if err := engine.TickNow(context.Background()); err != nil {
 		t.Fatalf("second tick failed: %v", err)
 	}
-	kinds := observer.kinds()
-	for _, want := range []ObserverEventKind{
-		ObserverClaim, ObserverFire, ObserverRetry, ObserverEngineError, ObserverExhaustion,
-	} {
-		if !containsKind(kinds, want) {
-			t.Fatalf("missing %q in observer events %v", want, kinds)
-		}
+	want := []ObserverEventKind{
+		ObserverDisable,
+		ObserverClaim, ObserverFire, ObserverEngineError, ObserverRetry,
+		ObserverClaim, ObserverFire, ObserverEngineError, ObserverExhaustion,
+	}
+	if kinds := observer.kinds(); fmt.Sprint(kinds) != fmt.Sprint(want) {
+		t.Fatalf("observer event order = %v, want %v", kinds, want)
 	}
 }
 

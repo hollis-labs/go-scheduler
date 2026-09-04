@@ -15,6 +15,9 @@ const (
 	// DefaultDueBatchLimit caps schedule materializations and fire attempts
 	// independently during one tick.
 	DefaultDueBatchLimit = 100
+	// DefaultClaimLease is how long a claimed fire remains exclusively owned
+	// before another engine may recover and redeliver the same attempt.
+	DefaultClaimLease = 5 * time.Minute
 )
 
 // oneTimeHorizon is the placeholder next-run persisted atomically when a
@@ -82,6 +85,17 @@ func WithDueBatchLimit(limit int) Option {
 	}
 }
 
+// WithClaimLease configures how long one claimed fire remains exclusively
+// owned. After the lease expires, another engine may recover and redeliver the
+// same FireID and Attempt. Non-positive values are ignored.
+func WithClaimLease(lease time.Duration) Option {
+	return func(engine *Engine) {
+		if lease > 0 {
+			engine.claimLease = lease
+		}
+	}
+}
+
 // WithObserver registers an application-neutral lifecycle observer. Observer
 // errors and panics are counted but never change scheduler state or outcomes.
 func WithObserver(observer Observer) Option {
@@ -111,6 +125,7 @@ type Engine struct {
 	clock         Clock
 	tickCadence   time.Duration
 	dueBatchLimit int
+	claimLease    time.Duration
 	observer      Observer
 
 	mu      sync.Mutex
@@ -130,6 +145,7 @@ func New(store Store, runner Runner, options ...Option) *Engine {
 		clock:         systemClock{},
 		tickCadence:   DefaultTickCadence,
 		dueBatchLimit: DefaultDueBatchLimit,
+		claimLease:    DefaultClaimLease,
 	}
 	for _, option := range options {
 		if option != nil {
@@ -292,24 +308,33 @@ func (e *Engine) materializeSchedule(ctx context.Context, schedule Schedule, now
 }
 
 func (e *Engine) dispatchFire(ctx context.Context, fire Fire, now time.Time) {
-	if fire.Status != FirePending && fire.Status != FireRetrying {
+	recovering := fire.Status == FireClaimed
+	if fire.Status != FirePending && fire.Status != FireRetrying && !recovering {
 		e.skip(ctx, fire, now, "fire_not_claimable")
 		return
 	}
-	if fire.NextAttemptAt.After(now) {
+	if recovering {
+		if fire.ClaimExpiresAt.After(now) {
+			e.skip(ctx, fire, now, "claim_not_expired")
+			return
+		}
+	} else if fire.NextAttemptAt.After(now) {
 		e.skip(ctx, fire, now, "fire_not_due")
 		return
 	}
-	if fire.Retry.Exhausted(fire.Attempt) {
+	if !recovering && fire.Retry.Exhausted(fire.Attempt) {
 		e.transitionExhausted(ctx, fire, now, nil, "maximum_attempts_reached")
 		return
 	}
 
+	claimExpiresAt := now.Add(e.claimLease)
 	claimed, won, err := e.store.ClaimFire(ctx, FireClaim{
 		FireID:          fire.ID,
 		ExpectedStatus:  fire.Status,
 		ExpectedAttempt: fire.Attempt,
+		ExpectedFiredAt: fire.FiredAt,
 		ClaimedAt:       now,
+		ClaimExpiresAt:  claimExpiresAt,
 	})
 	if err != nil {
 		e.engineError(ctx, fire, now, "claim_fire", err)
@@ -319,12 +344,16 @@ func (e *Engine) dispatchFire(ctx context.Context, fire Fire, now time.Time) {
 		e.skip(ctx, fire, now, "claim_conflict")
 		return
 	}
-	if err := validateClaim(fire, claimed, now); err != nil {
+	if err := validateClaim(fire, claimed, now, claimExpiresAt, recovering); err != nil {
 		e.engineError(ctx, claimed, now, "validate_claim", err)
 		return
 	}
 
-	e.observe(ctx, ObserverEvent{Kind: ObserverClaim, At: now, Fire: claimed})
+	claimReason := ""
+	if recovering {
+		claimReason = "expired_claim_recovery"
+	}
+	e.observe(ctx, ObserverEvent{Kind: ObserverClaim, At: now, Fire: claimed, Reason: claimReason})
 	e.observe(ctx, ObserverEvent{Kind: ObserverFire, At: now, Fire: claimed})
 
 	job := Job{
@@ -338,39 +367,51 @@ func (e *Engine) dispatchFire(ctx context.Context, fire Fire, now time.Time) {
 		Attempt:     claimed.Attempt,
 	}
 	enqueueErr := e.runner.Enqueue(ctx, job)
+	finishedAt := e.clock.Now().UTC()
+	persistCtx := context.WithoutCancel(ctx)
 	if enqueueErr == nil {
-		e.transitionSuccess(ctx, claimed, now)
+		e.transitionSuccess(persistCtx, claimed, finishedAt)
 		return
 	}
 
 	if errors.Is(enqueueErr, ErrDuplicateJob) {
-		e.transitionSkipped(ctx, claimed, now, enqueueErr, "duplicate_dispatch")
+		e.transitionSkipped(persistCtx, claimed, finishedAt, enqueueErr, "duplicate_dispatch")
 		return
 	}
 
-	e.engineError(ctx, claimed, now, "enqueue", enqueueErr)
+	e.engineError(ctx, claimed, finishedAt, "enqueue", enqueueErr)
 	if claimed.Retry.Exhausted(claimed.Attempt) {
-		e.transitionExhausted(ctx, claimed, now, enqueueErr, "maximum_attempts_reached")
+		e.transitionExhausted(persistCtx, claimed, finishedAt, enqueueErr, "maximum_attempts_reached")
 		return
 	}
-	e.transitionRetry(ctx, claimed, now, enqueueErr)
+	e.transitionRetry(persistCtx, claimed, finishedAt, enqueueErr)
 }
 
-func validateClaim(before, claimed Fire, claimedAt time.Time) error {
+func validateClaim(before, claimed Fire, claimedAt, claimExpiresAt time.Time, recovering bool) error {
 	if claimed.ID != before.ID || claimed.ScheduleID != before.ScheduleID {
 		return fmt.Errorf("%w: claimed fire identity changed", ErrInvalidClaim)
 	}
 	if claimed.Status != FireClaimed {
 		return fmt.Errorf("%w: status is %q", ErrInvalidClaim, claimed.Status)
 	}
-	if claimed.Attempt != before.Attempt+1 {
-		return fmt.Errorf("%w: attempt is %d, want %d", ErrInvalidClaim, claimed.Attempt, before.Attempt+1)
+	wantAttempt := before.Attempt + 1
+	if recovering {
+		wantAttempt = before.Attempt
+	}
+	if claimed.Attempt != wantAttempt {
+		return fmt.Errorf("%w: attempt is %d, want %d", ErrInvalidClaim, claimed.Attempt, wantAttempt)
 	}
 	if !claimed.FiredAt.Equal(claimedAt) {
 		return fmt.Errorf("%w: fired-at is %s, want %s", ErrInvalidClaim, claimed.FiredAt, claimedAt)
 	}
 	if !claimed.ScheduledAt.Equal(before.ScheduledAt) {
 		return fmt.Errorf("%w: scheduled-at changed", ErrInvalidClaim)
+	}
+	if !claimed.ClaimExpiresAt.Equal(claimExpiresAt) {
+		return fmt.Errorf("%w: claim-expires-at is %s, want %s", ErrInvalidClaim, claimed.ClaimExpiresAt, claimExpiresAt)
+	}
+	if !claimed.ClaimExpiresAt.After(claimed.FiredAt) {
+		return fmt.Errorf("%w: claim lease does not extend beyond fired-at", ErrInvalidClaim)
 	}
 	return nil
 }
@@ -445,6 +486,7 @@ func (e *Engine) transition(
 		FireID:        fire.ID,
 		Attempt:       fire.Attempt,
 		From:          fire.Status,
+		ClaimedAt:     fire.FiredAt,
 		To:            to,
 		At:            now,
 		NextAttemptAt: nextAttemptAt,

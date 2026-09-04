@@ -10,11 +10,11 @@ semantics, event names, activation policy, persistence schemas, and execution.
 
 ## Status
 
-Pre-1.0. The current branch introduces a breaking `Store` migration from the
+Pre-1.0. Version `v0.2.0` is a breaking `Store` migration from the
 schedule-row-only v0.1 contract to durable schedule plus fire contracts. The
 common constructor remains source-compatible as `New(store, runner)` and keeps
-the v0.1 defaults. See [CHANGELOG.md](CHANGELOG.md) for the migration checklist
-and pin a version in `go.mod`.
+the v0.1 polling defaults. See [MIGRATION.md](MIGRATION.md) for the exact store
+contract and downstream migration checklist, and pin `v0.2.0` in `go.mod`.
 
 Documentation: [pkg.go.dev/github.com/hollis-labs/go-scheduler](https://pkg.go.dev/github.com/hollis-labs/go-scheduler).
 
@@ -45,6 +45,7 @@ engine := scheduler.New(
     scheduler.WithClock(clock),
     scheduler.WithTickCadence(250*time.Millisecond),
     scheduler.WithDueBatchLimit(50),
+    scheduler.WithClaimLease(10*time.Minute),
     scheduler.WithObserver(observer),
 )
 ```
@@ -84,17 +85,37 @@ atomic behavior without prescribing tables or fields:
   derived fire if its ID has never existed, and advances the schedule. A
   terminal fire must never be recreated.
 - `ListDueFires` returns persisted `pending` or `retrying` fires whose next
-  attempt time is due.
+  attempt time is due, plus `claimed` fires whose claim lease expired.
 - `ClaimFire` atomically compares status and attempt, increments the attempt,
-  records observed `FiredAt`, and changes the status to `claimed`.
-- `TransitionFire` atomically compares the claimed status and attempt before
-  recording `retrying`, `succeeded`, `skipped`, or `exhausted`.
+  records observed `FiredAt` and `ClaimExpiresAt`, and changes the status to
+  `claimed`. Recovering an expired claim preserves the attempt number.
+- `TransitionFire` atomically compares claimed status, attempt, and `FiredAt`
+  before recording `retrying`, `succeeded`, `skipped`, or `exhausted`.
 - `DisableSchedule` disables a one-time schedule after its durable fire is
   materialized. The fire remains dispatchable.
 
 Both materialization uniqueness and per-attempt claims are compare-and-swap
 boundaries. Two engines may list the same due records, but only one can create a
 given fire and only one can dispatch a given attempt.
+
+## Restart Recovery
+
+Every claim has a lease (`ClaimExpiresAt`). If a process exits after claiming a
+fire but before persisting its result, a later engine lists that expired claim
+as due and reclaims it using status, attempt, and prior `FiredAt` as CAS
+preconditions. Reclaiming preserves `FireID` and `Attempt`; replacing `FiredAt`
+fences a late transition from the old owner.
+
+Recovery is at-least-once. A crash can happen after `Runner.Enqueue` accepts a
+job but before the success transition commits, so runners should deduplicate on
+`Job.FireID` and return an error wrapping `ErrDuplicateJob`. Set
+`WithClaimLease` longer than the application's maximum expected `Enqueue`
+latency. The default is five minutes.
+
+Outcome transitions use a cancellation-detached context once `Enqueue`
+returns, so cancellation of the tick cannot by itself strand a completed
+attempt. Store calls must still implement their own finite database or network
+timeouts.
 
 ## Retry And Exhaustion
 
@@ -142,6 +163,12 @@ returned errors and panics are isolated: they increment
 `Status.ObserverErrors` and do not alter claims, transitions, or dispatch
 outcomes.
 
+Ordering is deterministic for a claimed attempt: `claim`, `fire`, then either
+`success`; `skip`; or `engine_error` followed by `retry`/`exhaustion`. A
+one-time schedule's `disable` event occurs after materialization and before its
+claim events. An expired-claim recovery emits another `claim`/`fire` pair for
+the redelivery, with `Reason == "expired_claim_recovery"` on `claim`.
+
 ## API Overview
 
 - `Engine` / `New(store, runner, ...Option)` — materializes and dispatches due
@@ -153,7 +180,8 @@ outcomes.
 - `FireCreation`, `FireClaim`, `FireTransition` — store CAS request contracts.
 - `Job` / `Runner` — opaque dispatch seam.
 - `Observer`, `ObserverFunc`, `ObserverEvent` — neutral lifecycle hooks.
-- `Clock`, `Ticker`, and engine options — deterministic time and polling.
+- `Clock`, `Ticker`, and engine options — deterministic time, polling, batches,
+  and claim-lease recovery.
 - `Status` — dispatch, retry, skip, exhaustion, worker-error, and observer-error
   counters.
 - `ValidateCron`, `NextRun`, and `DeriveFireID` — standalone helpers.
@@ -173,6 +201,11 @@ persist fires so retries and exhaustion survive ticks and process restarts.
 Existing runners may continue reading `Job.RunID` during migration, but should
 switch deduplication to `Job.FireID`. Unlike v0.1, `ErrDuplicateJob` terminates
 the fire as `skipped` instead of requeuing it indefinitely.
+
+The remote `v0.1.1` tag contains an earlier draft of the breaking durable-fire
+contract. It remains immutable but was never promoted as the supported GitHub
+Release. Use `v0.2.0`, which adds restart-safe leased claims and stale-owner
+fencing. See [MIGRATION.md](MIGRATION.md).
 
 ## Dependencies
 
