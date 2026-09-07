@@ -31,8 +31,6 @@ go.work.sum
 .claude/
 agentrc.yaml
 agentrc.yml
-CLAUDE.md
-AGENTS.md
 AUDIT_RESULTS.md
 .lefthook.yml
 lefthook.yml
