@@ -11,7 +11,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `sqlstore`: a reference SQLite implementation of `Store` over a dedicated
   schema, with `Migrate`, `Schema`, and schedule management helpers. Every
   compare-and-swap, including `ExpectedFiredAt` on `ClaimFire`, is enforced in
-  the SQL `WHERE` clause.
+  the SQL `WHERE` clause. Requires SQLite 3.35 or newer (`UPDATE ... RETURNING`).
 - `conformance`: a portable `Run` suite that checks any `Store` implementation
   against the claim, lease, recovery, and fencing contract, including that a
   stale `ExpectedFiredAt` is rejected by the store. Stores implement the
