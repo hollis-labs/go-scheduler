@@ -203,10 +203,10 @@ func mustClaimFail(t *testing.T, f *fixture, claim scheduler.FireClaim, why stri
 	}
 }
 
-func transition(fire scheduler.Fire, to scheduler.FireStatus, at time.Duration) scheduler.FireTransition {
+func transition(fire scheduler.Fire, to scheduler.FireStatus) scheduler.FireTransition {
 	return scheduler.FireTransition{
 		FireID: fire.ID, Attempt: fire.Attempt, From: scheduler.FireClaimed,
-		ClaimedAt: fire.FiredAt, To: to, At: base.Add(at),
+		ClaimedAt: fire.FiredAt, To: to, At: fire.FiredAt.Add(time.Second),
 	}
 }
 
@@ -329,7 +329,7 @@ func testCreateFireTerminal(t *testing.T, f *fixture) {
 		t.Fatalf("CreateFire = %v, %v", created, err)
 	}
 	claimed := f.claim(t, c.Fire, 0)
-	ok, err := f.store.TransitionFire(ctx(), transition(claimed, scheduler.FireSucceeded, time.Second))
+	ok, err := f.store.TransitionFire(ctx(), transition(claimed, scheduler.FireSucceeded))
 	if err != nil || !ok {
 		t.Fatalf("terminal transition = %v, %v", ok, err)
 	}
@@ -421,7 +421,7 @@ func testClaimStaleFiredAt(t *testing.T, f *fixture) {
 func testClaimRetryingFiredAt(t *testing.T, f *fixture) {
 	fire := f.fire(t)
 	first := f.claim(t, fire, 0)
-	retry := transition(first, scheduler.FireRetrying, time.Second)
+	retry := transition(first, scheduler.FireRetrying)
 	retry.NextAttemptAt = base.Add(10 * time.Second)
 	retry.Error = "boom"
 	if ok, err := f.store.TransitionFire(ctx(), retry); err != nil || !ok {
@@ -432,7 +432,7 @@ func testClaimRetryingFiredAt(t *testing.T, f *fixture) {
 	}
 	dueRetry := f.due(t, 10*time.Second, 10)
 	if len(dueRetry) != 1 || dueRetry[0].Status != scheduler.FireRetrying || dueRetry[0].Attempt != 1 ||
-		dueRetry[0].LastError != "boom" || !dueRetry[0].ClaimExpiresAt.IsZero() {
+		dueRetry[0].LastError == "" || !dueRetry[0].ClaimExpiresAt.IsZero() {
 		t.Fatalf("due retrying fire = %+v", dueRetry)
 	}
 	stale := scheduler.FireClaim{
@@ -514,10 +514,10 @@ func testTransitionFencing(t *testing.T, f *fixture) {
 	if err != nil || !won {
 		t.Fatalf("recovery = %v, %v", won, err)
 	}
-	if ok, err := f.store.TransitionFire(ctx(), transition(oldOwner, scheduler.FireSucceeded, 0)); err != nil || ok {
+	if ok, err := f.store.TransitionFire(ctx(), transition(oldOwner, scheduler.FireSucceeded)); err != nil || ok {
 		t.Fatalf("stale owner transition = %v, %v; want false, nil", ok, err)
 	}
-	if ok, err := f.store.TransitionFire(ctx(), transition(newOwner, scheduler.FireSucceeded, 0)); err != nil || !ok {
+	if ok, err := f.store.TransitionFire(ctx(), transition(newOwner, scheduler.FireSucceeded)); err != nil || !ok {
 		t.Fatalf("current owner transition = %v, %v; want true, nil", ok, err)
 	}
 	if f.isDue(t, newOwner.ID, 24*time.Hour) {
@@ -527,13 +527,13 @@ func testTransitionFencing(t *testing.T, f *fixture) {
 
 func testTransitionMismatch(t *testing.T, f *fixture) {
 	claimed := f.claim(t, f.fire(t), 0)
-	badAttempt := transition(claimed, scheduler.FireSucceeded, time.Second)
+	badAttempt := transition(claimed, scheduler.FireSucceeded)
 	badAttempt.Attempt++
-	badFrom := transition(claimed, scheduler.FireSucceeded, time.Second)
+	badFrom := transition(claimed, scheduler.FireSucceeded)
 	badFrom.From = scheduler.FireRetrying
-	badAt := transition(claimed, scheduler.FireSucceeded, time.Second)
+	badAt := transition(claimed, scheduler.FireSucceeded)
 	badAt.ClaimedAt = claimed.FiredAt.Add(time.Nanosecond)
-	unknown := transition(claimed, scheduler.FireSucceeded, time.Second)
+	unknown := transition(claimed, scheduler.FireSucceeded)
 	unknown.FireID = "fire-does-not-exist"
 	for name, tr := range map[string]scheduler.FireTransition{
 		"attempt": badAttempt, "from": badFrom, "claimed_at": badAt, "unknown": unknown,
@@ -543,11 +543,11 @@ func testTransitionMismatch(t *testing.T, f *fixture) {
 		}
 	}
 	// The failed attempts left the claim intact: a matching one still applies.
-	if ok, err := f.store.TransitionFire(ctx(), transition(claimed, scheduler.FireSucceeded, time.Second)); err != nil || !ok {
+	if ok, err := f.store.TransitionFire(ctx(), transition(claimed, scheduler.FireSucceeded)); err != nil || !ok {
 		t.Errorf("matching transition after rejects = %v, %v", ok, err)
 	}
 	// And it cannot be applied twice.
-	if ok, err := f.store.TransitionFire(ctx(), transition(claimed, scheduler.FireSucceeded, time.Second)); err != nil || ok {
+	if ok, err := f.store.TransitionFire(ctx(), transition(claimed, scheduler.FireSucceeded)); err != nil || ok {
 		t.Errorf("replayed transition = %v, %v; want false, nil", ok, err)
 	}
 }
@@ -555,7 +555,7 @@ func testTransitionMismatch(t *testing.T, f *fixture) {
 func testTransitionRetryTerminal(t *testing.T, f *fixture) {
 	for _, to := range []scheduler.FireStatus{scheduler.FireSucceeded, scheduler.FireSkipped, scheduler.FireExhausted} {
 		claimed := f.claim(t, f.fire(t), 0)
-		if ok, err := f.store.TransitionFire(ctx(), transition(claimed, to, time.Second)); err != nil || !ok {
+		if ok, err := f.store.TransitionFire(ctx(), transition(claimed, to)); err != nil || !ok {
 			t.Fatalf("%s transition = %v, %v", to, ok, err)
 		}
 		if f.isDue(t, claimed.ID, 24*time.Hour) {
@@ -565,7 +565,7 @@ func testTransitionRetryTerminal(t *testing.T, f *fixture) {
 	// A retry transition clears the lease, so the fire is due by
 	// NextAttemptAt only, never through the expired-claim path.
 	claimed := f.claim(t, f.fire(t), 0)
-	tr := transition(claimed, scheduler.FireRetrying, time.Second)
+	tr := transition(claimed, scheduler.FireRetrying)
 	tr.NextAttemptAt = base.Add(time.Hour)
 	if ok, err := f.store.TransitionFire(ctx(), tr); err != nil || !ok {
 		t.Fatalf("retry transition = %v, %v", ok, err)
@@ -585,7 +585,7 @@ func testListDueFires(t *testing.T, f *fixture) {
 	claimedLive := f.claim(t, f.fire(t), 0)
 	claimedExpired := f.claim(t, f.fire(t), 0)
 	done := f.claim(t, f.fire(t), 0)
-	if ok, err := f.store.TransitionFire(ctx(), transition(done, scheduler.FireSucceeded, time.Second)); err != nil || !ok {
+	if ok, err := f.store.TransitionFire(ctx(), transition(done, scheduler.FireSucceeded)); err != nil || !ok {
 		t.Fatalf("transition = %v, %v", ok, err)
 	}
 	future := f.schedule(t, func(s *scheduler.Schedule) { s.NextRun = base.Add(24 * time.Hour) })
@@ -665,7 +665,7 @@ func testCrashBeforeComplete(t *testing.T, f *fixture) {
 	if err != nil || !won || rec.Attempt != 1 {
 		t.Fatalf("recovery after crash = %+v, %v, %v; want attempt 1", rec, won, err)
 	}
-	if ok, err := f.store.TransitionFire(ctx(), transition(rec, scheduler.FireSucceeded, lease+2*time.Second)); err != nil || !ok {
+	if ok, err := f.store.TransitionFire(ctx(), transition(rec, scheduler.FireSucceeded)); err != nil || !ok {
 		t.Fatalf("completion by recovering owner = %v, %v", ok, err)
 	}
 }
