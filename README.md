@@ -141,6 +141,8 @@ given fire and only one can dispatch a given attempt.
 
 ## sqlstore: a reference SQLite Store
 
+**Requirement: SQLite 3.35 or newer.** `sqlstore` uses `UPDATE ... RETURNING`, so any driver bundling an older SQLite (or a non-SQLite database) is unsupported. The tested driver, `modernc.org/sqlite`, comfortably exceeds this minimum; any other driver must be checked against it.
+
 `github.com/hollis-labs/go-scheduler/sqlstore` implements `Store` over a small
 schema of its own (`gosched_schedules`, `gosched_fires`). It is for new
 adopters; applications with existing tables keep them and use `conformance`
