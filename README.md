@@ -54,6 +54,47 @@ engine := scheduler.New(
 clock implements `Now` and `NewTicker`; this makes both synchronous and
 background-loop tests independent of wall time.
 
+### Runnable example
+
+This program needs `modernc.org/sqlite` (or any other SQLite driver) in your own
+`go.mod`. It runs a one-time schedule through the reference store and prints the
+dispatch:
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "time"
+
+    _ "modernc.org/sqlite"
+
+    scheduler "github.com/hollis-labs/go-scheduler"
+    "github.com/hollis-labs/go-scheduler/sqlstore"
+)
+
+type printRunner struct{}
+
+func (printRunner) Enqueue(_ context.Context, job scheduler.Job) error {
+    fmt.Println("dispatch", job.ScheduleID, job.Attempt)
+    return nil
+}
+
+func main() {
+    ctx := context.Background()
+    db, _ := sql.Open("sqlite", "file:example.db?_pragma=busy_timeout(5000)")
+    defer db.Close()
+    _ = sqlstore.Migrate(ctx, db)
+    store, _ := sqlstore.New(db)
+    _ = store.CreateSchedule(ctx, scheduler.Schedule{
+        ID: "hello", NextRun: time.Now().Add(-time.Second), Enabled: true, JobType: "print",
+    })
+    _ = scheduler.New(store, printRunner{}).TickNow(ctx)
+}
+```
+
 ## Stable Fire Identity
 
 A schedule occurrence is identified by:
@@ -97,6 +138,57 @@ atomic behavior without prescribing tables or fields:
 Both materialization uniqueness and per-attempt claims are compare-and-swap
 boundaries. Two engines may list the same due records, but only one can create a
 given fire and only one can dispatch a given attempt.
+
+## sqlstore: a reference SQLite Store
+
+**Requirement: SQLite 3.35 or newer.** `sqlstore` uses `UPDATE ... RETURNING`, so any driver bundling an older SQLite (or a non-SQLite database) is unsupported. The tested driver, `modernc.org/sqlite`, comfortably exceeds this minimum; any other driver must be checked against it.
+
+`github.com/hollis-labs/go-scheduler/sqlstore` implements `Store` over a small
+schema of its own (`gosched_schedules`, `gosched_fires`). It is for new
+adopters; applications with existing tables keep them and use `conformance`
+below instead. You open the `*sql.DB` with any SQLite driver, apply the schema
+with `Migrate` (or read the DDL from `Schema()`), and hand the store to the
+engine:
+
+```go
+db, _ := sql.Open("sqlite", "file:sched.db?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)")
+_ = sqlstore.Migrate(ctx, db)
+store, _ := sqlstore.New(db)
+
+_ = store.CreateSchedule(ctx, scheduler.Schedule{
+    ID: "nightly", CronExpr: "0 3 * * *", NextRun: next, Enabled: true, JobType: "backup",
+})
+engine := scheduler.New(store, runner)
+```
+
+Each compare-and-swap is one SQL statement whose `WHERE` clause carries every
+precondition, including `ExpectedFiredAt` on `ClaimFire` and `ClaimedAt` on
+`TransitionFire`, so a stale owner loses inside the database rather than
+depending on a lock held by the caller. `ClaimFire` uses `UPDATE ... RETURNING`
+(SQLite 3.35 or newer). Timestamps are stored as fixed-width UTC text with
+nanosecond precision.
+
+## conformance: test any Store
+
+`github.com/hollis-labs/go-scheduler/conformance` is a portable suite for the
+`Store` contract, driven only through the `Store` interface, so it works
+against your own schema and adapter:
+
+```go
+func TestMyStoreConforms(t *testing.T) {
+    conformance.Run(t, func(t *testing.T) scheduler.Store {
+        return newMyStoreOverTempDatabase(t) // must also implement conformance.Seeder
+    })
+}
+```
+
+The store must additionally implement `conformance.Seeder` (one method,
+`CreateSchedule`), because `Store` itself never creates schedules. The suite
+covers the `CreateFire` schedule-advance CAS, pending/retrying claims,
+expired-claim recovery, the requirement that a stale `ExpectedFiredAt` is
+rejected by the store, `ClaimedAt` fencing of a stale owner in
+`TransitionFire`, `ListDueFires` selection, crash-before-complete recovery, and
+racing claimers. Run it with `-race` and a repeat count.
 
 ## Restart Recovery
 
@@ -209,9 +301,12 @@ fencing. See [MIGRATION.md](MIGRATION.md).
 
 ## Dependencies
 
-The only direct external dependency is
+The only direct external dependency of the engine is
 [`github.com/robfig/cron/v3`](https://pkg.go.dev/github.com/robfig/cron/v3) for
-standard cron parsing. The module imports no application packages.
+standard cron parsing. `sqlstore` and `conformance` import only the standard
+library and the root package; no SQL driver is linked into your build unless you
+choose one. `modernc.org/sqlite` appears in `go.mod` for this module's own
+tests only. The module imports no application packages.
 
 ## Testing
 
@@ -220,8 +315,38 @@ go test ./...
 go test -race ./...
 ```
 
-The test suite uses in-memory contract fakes and includes a concurrent
-two-engine CAS test proving that one fire attempt cannot dispatch twice.
+The engine tests use in-memory contract fakes and include a concurrent
+two-engine CAS test proving that one fire attempt cannot dispatch twice. The
+`sqlstore` tests run the `conformance` suite against a temporary SQLite database
+and race two engines over one database file.
+
+## Compatibility
+
+This module is pre-1.0: minor releases may break the exported API, as v0.2.0
+did for `Store`. Pin an exact version and read [CHANGELOG.md](CHANGELOG.md)
+before upgrading. Additions such as `sqlstore` and `conformance` do not change
+the engine or `Store` contract. It needs Go 1.26.6 or newer (the `go` line of
+`go.mod`).
+
+## Out of scope
+
+- Cron parsing, next-run computation, retry and backoff, and lease duration.
+  The engine owns these; `sqlstore` and `conformance` do not add policy.
+- A required schema. Applications keep their own tables; `sqlstore` is a
+  reference and `conformance` verifies any implementation.
+- Job execution, queues and application event names. Those belong to your
+  `Runner`.
+- Databases other than SQLite in `sqlstore`.
+
+## Development
+
+```bash
+gofmt -l .
+go vet ./...
+go test -race -count=1 ./...
+```
+
+CI (`.github/workflows/check.yml`) is the full gate.
 
 ## License
 

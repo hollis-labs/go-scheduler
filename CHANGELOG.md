@@ -4,10 +4,23 @@ All notable changes to `go-scheduler` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## v0.3.0 — 2026-09-30
+
+### Added
+
+- `sqlstore`: a reference SQLite implementation of `Store` over a dedicated
+  schema, with `Migrate`, `Schema`, and schedule management helpers. Every
+  compare-and-swap, including `ExpectedFiredAt` on `ClaimFire`, is enforced in
+  the SQL `WHERE` clause. Requires SQLite 3.35 or newer (`UPDATE ... RETURNING`).
+- `conformance`: a portable `Run` suite that checks any `Store` implementation
+  against the claim, lease, recovery, and fencing contract, including that a
+  stale `ExpectedFiredAt` is rejected by the store. Stores implement the
+  one-method `Seeder` so the suite can create schedules.
+- `modernc.org/sqlite` as a test-only dependency of this module.
 
 ### Changed
 
+- Added `.github/workflows/check.yml` and `.golangci.yml`, and README Compatibility, Out of scope, Development and runnable-example sections.
 - Raised the module's `go` directive to `1.26.6` (Go floor across the portfolio); CI now uses `go-version-file: go.mod`.
 
 ## v0.2.0 — 2026-09-04

@@ -1,0 +1,202 @@
+# .golangci.yml — shared golangci-lint configuration (v2 format) for the
+# hollis-labs portfolio.
+#
+# CANONICAL COPY: folio preset `go-baseline` —
+# `presets/go-baseline/files/.golangci.yml.tmpl` in hollis-labs/folio.
+# `presets/base`, `nanite-plugin` and `sysop-ui` still carry hand-synced copies
+# of this file (they have not yet composed `go-baseline`); keep the shared
+# rules identical to `presets/base/files/.golangci.yml.tmpl`.
+# Change it there and re-render. Editing this file in a generated project
+# forks it; that is how the previous shared copy ended up as four different
+# files claiming to be the same one.
+#
+# Philosophy:
+#   - Catch real bugs, not style nits
+#   - Zero false-positive tolerance on CI
+#   - Use `--new` flag for gradual adoption on legacy code
+#   - Errors only — no warnings that train developers to ignore output
+#
+# Usage:
+#   golangci-lint run --new          # lint only changed lines (adoption mode)
+#   golangci-lint run                # full lint (target state)
+#
+# Note: run.timeout is ignored in v2 (no timeout by default).
+# Note: run.skip-files replaced by linters.exclusions.generated + rules.
+
+version: "2"
+
+run:
+  # Match go.mod — analysis against an older language version can misclassify
+  # valid code or omit checks introduced by the active toolchain. Both are
+  # rendered from the `go_version` input so they cannot drift apart.
+  go: "1.26.6"
+
+# ---------------------------------------------------------------------------
+# Linter selection
+# ---------------------------------------------------------------------------
+linters:
+  # Start with nothing enabled, then add explicitly.
+  default: none
+  enable:
+    # --- Essential (catch real bugs) ---
+    - errcheck       # unchecked errors — the #1 source of silent failures in Go
+    - govet          # go vet: shadow, printf format, struct tags, etc.
+    - staticcheck    # 150+ deep analysis checks (SA*, ST*, QF* series)
+    - unused         # dead code: unused funcs, types, consts, variables
+    - ineffassign    # assignments to variables that are never read
+    # typecheck is implicit in v2 — no longer a separate linter
+
+    # --- Security ---
+    - gosec          # hardcoded creds, SQL injection, weak crypto, file perms
+
+    # --- Style (kept minimal — errors, not opinions) ---
+    - revive         # modern golint replacement; rules configured below
+    - misspell       # typos in comments and strings
+    - unconvert      # unnecessary type conversions (e.g., int(x) where x is int)
+    - unparam        # function parameters that are always the same value
+
+    # --- Correctness ---
+    - exhaustive     # switch on enum misses cases — prevents silent bugs
+    - errorlint      # enforce errors.Is/As and %w wrapping
+    - nilerr         # returning nil in an error path (if err != nil { return nil })
+
+  # Explicitly disabled — documented so future us knows why.
+  # - nilaway      : experimental; evaluate when it stabilizes
+  # - gocyclo      : complexity metrics add noise on legacy code
+  # - cyclop       : same category as gocyclo
+  # - gocritic     : too opinionated for initial rollout
+  # - prealloc     : premature optimization warnings
+  # - modernize    : save for a dedicated cleanup pass (good, but noisy)
+
+  # ---------------------------------------------------------------------------
+  # Per-linter settings
+  # ---------------------------------------------------------------------------
+  settings:
+    errcheck:
+      # Don't require checking errors on fmt.Print*/fmt.Fprint* — they almost
+      # never fail and checking them clutters code.
+      exclude-functions:
+        - fmt.Print
+        - fmt.Println
+        - fmt.Printf
+        - fmt.Fprint
+        - fmt.Fprintln
+        - fmt.Fprintf
+
+    exhaustive:
+      # Only flag switch statements that have no default case.
+      # A default case counts as "handling" remaining values.
+      default-signifies-exhaustive: true
+
+    gosec:
+      excludes:
+        # G104: "Errors unhandled" — already covered by errcheck, no need to
+        # double-report.
+        - G104
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment is useful but noisy on existing structs.
+        # Enable in a dedicated cleanup pass.
+        - fieldalignment
+
+    misspell:
+      locale: US
+
+    revive:
+      # Only enable rules that catch real problems. Avoid cosmetic rules that
+      # create busywork on legacy code.
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: dot-imports
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: exported
+          disabled: true   # too noisy on internal packages — revisit later
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: unused-parameter
+          disabled: true   # unparam covers this
+        - name: var-declaration
+        - name: var-naming
+
+    staticcheck:
+      checks:
+        - "all"
+        # Disable ST1000 (package comments) — not every package needs a doc
+        # comment, especially internal ones.
+        - "-ST1000"
+
+    unparam:
+      # Check exported functions too — catches API surface issues.
+      check-exported: false  # start conservative; flip later
+
+  # ---------------------------------------------------------------------------
+  # Exclusion rules (replaces v1 issues.exclude-rules)
+  # ---------------------------------------------------------------------------
+  exclusions:
+    # Handle generated files (replaces v1 run.skip-files for *_gen.go, *.pb.go).
+    generated: lax
+
+    rules:
+      # Test files: relax errcheck — test helpers often ignore errors
+      # intentionally (e.g., httptest, os.Remove cleanup).
+      - path: _test\.go
+        linters:
+          - errcheck
+
+      # Test files: relax unparam — test helpers often have fixed params.
+      - path: _test\.go
+        linters:
+          - unparam
+
+      # Local: engine_test.go predates the lint gate and uses the British
+      # spelling in test IDs and messages; existing tests stay unmodified.
+      - path: ^engine_test\.go$
+        linters:
+          - misspell
+
+      # Generated files belt-and-suspenders (in case generated: lax misses).
+      - path: _gen\.go
+        linters:
+          - all
+
+      - path: \.pb\.go
+        linters:
+          - all
+
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+
+# ---------------------------------------------------------------------------
+# Issue output
+# ---------------------------------------------------------------------------
+issues:
+  # Cap output so CI logs stay readable. Developers can re-run without caps
+  # locally if they want the full list.
+  max-issues-per-linter: 50
+  max-same-issues: 5
+
+# ---------------------------------------------------------------------------
+# Formatters
+# ---------------------------------------------------------------------------
+formatters:
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
