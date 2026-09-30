@@ -54,6 +54,47 @@ engine := scheduler.New(
 clock implements `Now` and `NewTicker`; this makes both synchronous and
 background-loop tests independent of wall time.
 
+### Runnable example
+
+This program needs `modernc.org/sqlite` (or any other SQLite driver) in your own
+`go.mod`. It runs a one-time schedule through the reference store and prints the
+dispatch:
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "fmt"
+    "time"
+
+    _ "modernc.org/sqlite"
+
+    scheduler "github.com/hollis-labs/go-scheduler"
+    "github.com/hollis-labs/go-scheduler/sqlstore"
+)
+
+type printRunner struct{}
+
+func (printRunner) Enqueue(_ context.Context, job scheduler.Job) error {
+    fmt.Println("dispatch", job.ScheduleID, job.Attempt)
+    return nil
+}
+
+func main() {
+    ctx := context.Background()
+    db, _ := sql.Open("sqlite", "file:example.db?_pragma=busy_timeout(5000)")
+    defer db.Close()
+    _ = sqlstore.Migrate(ctx, db)
+    store, _ := sqlstore.New(db)
+    _ = store.CreateSchedule(ctx, scheduler.Schedule{
+        ID: "hello", NextRun: time.Now().Add(-time.Second), Enabled: true, JobType: "print",
+    })
+    _ = scheduler.New(store, printRunner{}).TickNow(ctx)
+}
+```
+
 ## Stable Fire Identity
 
 A schedule occurrence is identified by:
@@ -276,6 +317,34 @@ The engine tests use in-memory contract fakes and include a concurrent
 two-engine CAS test proving that one fire attempt cannot dispatch twice. The
 `sqlstore` tests run the `conformance` suite against a temporary SQLite database
 and race two engines over one database file.
+
+## Compatibility
+
+This module is pre-1.0: minor releases may break the exported API, as v0.2.0
+did for `Store`. Pin an exact version and read [CHANGELOG.md](CHANGELOG.md)
+before upgrading. Additions such as `sqlstore` and `conformance` do not change
+the engine or `Store` contract. It needs Go 1.26.6 or newer (the `go` line of
+`go.mod`).
+
+## Out of scope
+
+- Cron parsing, next-run computation, retry and backoff, and lease duration.
+  The engine owns these; `sqlstore` and `conformance` do not add policy.
+- A required schema. Applications keep their own tables; `sqlstore` is a
+  reference and `conformance` verifies any implementation.
+- Job execution, queues and application event names. Those belong to your
+  `Runner`.
+- Databases other than SQLite in `sqlstore`.
+
+## Development
+
+```bash
+gofmt -l .
+go vet ./...
+go test -race -count=1 ./...
+```
+
+CI (`.github/workflows/check.yml`) is the full gate.
 
 ## License
 

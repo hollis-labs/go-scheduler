@@ -20,6 +20,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Added `.github/workflows/check.yml` and `.golangci.yml`, and README Compatibility, Out of scope, Development and runnable-example sections.
 - Raised the module's `go` directive to `1.26.6` (Go floor across the portfolio); CI now uses `go-version-file: go.mod`.
 
 ## v0.2.0 — 2026-09-04

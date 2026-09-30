@@ -1,0 +1,64 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # go.mod is the single Go pin: the `go` line (1.26.6 by decision) is
+      # the floor; an optional `toolchain` line, if present, wins (setup-go
+      # v6+ only — v5 ignores it and would install the `go` line).
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: modules
+        run: |
+          go mod verify
+          go mod tidy -diff
+
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "Files need gofmt:"
+            echo "$out"
+            exit 1
+          fi
+
+      # A lint/test/vuln run over zero packages reports success while
+      # checking nothing. Make "examined nothing" its own failure.
+      - name: packages discovered
+        run: |
+          n=$(go list ./... | wc -l)
+          if [ "$n" -lt 1 ]; then
+            echo "go list ./... found no packages"
+            exit 2
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # The pinned golangci-lint must be built with a Go >= this module's
+      # `go` line minor, or it refuses to load the config (v2.1.6 was built
+      # with go1.24 and fails every go 1.26 module). v2.11.4: go1.26.1 (ok for 1.26.x).
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          version: v2.11.4
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      # Pinned, not @latest: an unpinned scanner changes its verdict without a
+      # commit. v1.8.0 declares `go 1.26.0`.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

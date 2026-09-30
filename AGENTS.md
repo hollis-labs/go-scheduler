@@ -23,7 +23,7 @@ go test -race -count=1 ./...
 ```
 
 Tests inject a clock rather than sleeping, so the suite is fast and
-wall-time-independent. There is no CI workflow in this repo.
+wall-time-independent. CI (`.github/workflows/check.yml`) runs the full gate with `.golangci.yml`; `sqlstore/` and `conformance/` are additive subpackages, and `sqlstore` tests run the conformance suite.
 
 ## Boundaries
 
