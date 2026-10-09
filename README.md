@@ -1,5 +1,22 @@
 # go-scheduler
 
+## Maintenance moved to `github.com/hollis-labs/libs/util`
+
+This standalone repository is retired. Maintained source and documentation are
+in [github.com/hollis-labs/libs/util/scheduler](https://github.com/hollis-labs/libs/tree/util%2Fv0.1.0/util/scheduler), released in **`util/v0.1.0`**.
+Install the replacement module:
+
+```sh
+go get github.com/hollis-labs/libs/util@v0.1.0
+```
+
+Replace the `github.com/hollis-labs/go-scheduler` import prefix with
+`github.com/hollis-labs/libs/util/scheduler`, retaining the package subpath. Review the replacement documentation
+for any API changes before migrating. Existing standalone tags and history remain
+available; old module pins do not automatically redirect to the new module.
+
+The documentation below describes historical standalone usage.
+
 `go-scheduler` is an application-neutral timed activation engine for Go. It
 materializes due schedules into durable fires, claims each fire attempt with
 compare-and-swap semantics, and dispatches opaque jobs to a `Runner`.
